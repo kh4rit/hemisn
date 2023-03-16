@@ -2,6 +2,9 @@ import torch
 import torch.nn as nn
 from transformers import AutoModel, AutoTokenizer
 
+if not torch.backends.mps.is_available():
+    print ("MPS device not found.")
+
 class HybridMemoryModel(nn.Module):
     def __init__(self, pretrained_model_name, memory_size):
         super(HybridMemoryModel, self).__init__()
@@ -15,12 +18,13 @@ class HybridMemoryModel(nn.Module):
         self.start_predictor = nn.Linear(hidden_size, 1)
         self.end_predictor = nn.Linear(hidden_size, 1)
 
-    def forward(self, input_ids):
+    def forward(self, input_ids, attention_mask=None):
+        # The variable input_tokens is defined in the forward method of the HybridMemoryModel, but it is not used anywhere
         # Tokenize the input text
-        input_tokens = self.tokenizer(input_text, return_tensors="pt", padding=True, truncation=True)
+        # input_tokens = self.tokenizer(input_text, return_tensors="pt", padding=True, truncation=True)
         
         # Obtain contextualized embeddings from the transformer
-        transformer_output = self.transformer(input_ids=input_ids)
+        transformer_output = self.transformer(input_ids=input_ids, attention_mask=attention_mask)
         hidden_states = transformer_output.last_hidden_state
         
         # Calculate attention scores between hidden states and memory
@@ -42,12 +46,12 @@ class HybridMemoryModel(nn.Module):
         return start_logits, end_logits
 
 def decode_answer(input_text, start_logits, end_logits):
-    input_tokens = model.tokenizer(input_text, return_tensors="pt", padding=True, truncation=True)
-    start_positions = torch.argmax(start_logits, dim=-1)
-    end_positions = torch.argmax(end_logits, dim=-1)
+    input_tokens = input_tokens = model.tokenizer(input_text, return_tensors="pt", padding=True, truncation=True, add_special_tokens=False)
+    start_position = torch.argmax(start_logits, dim=-1)
+    end_position = torch.argmax(end_logits, dim=-1)
     
     answers = []
-    for i, (start, end) in enumerate(zip(start_positions, end_positions)):
+    for i, (start, end) in enumerate(zip(start_position, end_position)):
         answer_tokens = input_tokens['input_ids'][i][start:end + 1]
         answer = model.tokenizer.decode(answer_tokens)
         answers.append(answer)
@@ -58,8 +62,15 @@ pretrained_model_name = "bert-base-uncased"
 memory_size = 128
 
 model = HybridMemoryModel(pretrained_model_name, memory_size)
+
+device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+model.to(device)
+
 input_text = ["What is the capital of France?", "Who wrote 'The Catcher in the Rye'?"]
 input_ids = model.tokenizer(input_text, return_tensors="pt", padding=True, truncation=True)["input_ids"]
+
+input_ids = input_ids.to(device)
+
 start_logits, end_logits = model(input_ids=input_ids)
 
 answers = decode_answer(input_text, start_logits, end_logits)
@@ -97,43 +108,105 @@ def char_to_token_indices(context, answer_start, answer_end, tokenizer, max_leng
 
     return token_start_index, token_end_index
 
-def preprocess_data(example):
-    input_text = example["context"] + " " + example["question"]
-    start_position = example["answers"]["answer_start"][0]
-    end_position = start_position + len(example["answers"]["text"][0])
-    
-    # Convert character indices to token indices
-    token_start_position, token_end_position = char_to_token_indices(
-        example["context"], start_position, end_position, model.tokenizer, max_length=512
+from transformers import BertTokenizerFast
+tokenizer = BertTokenizerFast.from_pretrained('bert-base-uncased')
+
+def prepare_data(context, question, answer):
+    max_length = 512  # BERT model's max length
+
+    tokenized_context = tokenizer.encode_plus(
+        context,
+        return_offsets_mapping=True,
+        add_special_tokens=False,
+    )
+    tokenized_question = tokenizer.encode_plus(
+        question,
+        return_offsets_mapping=True,
+        add_special_tokens=False,
     )
 
+    # Combine tokenized_context and tokenized_question
+    input_ids = (
+        [tokenizer.cls_token_id]
+        + tokenized_question["input_ids"]
+        + [tokenizer.sep_token_id]
+        + tokenized_context["input_ids"]
+        + [tokenizer.sep_token_id]
+    )
+    offsets = (
+        [(0, 0)]
+        + tokenized_question["offset_mapping"]
+        + [(0, 0)]
+        + tokenized_context["offset_mapping"]
+        + [(0, 0)]
+    )
+
+    # Truncate or pad the input_ids and offsets to max_length
+    input_ids = input_ids[:max_length] + [tokenizer.pad_token_id] * (max_length - len(input_ids))
+    offsets = offsets[:max_length] + [(0, 0)] * (max_length - len(offsets))
+
+    answer_start = context.find(answer)
+    answer_end = answer_start + len(answer)
+
+    if answer_start == -1:
+        return None, None, None
+
+    token_start_position, token_end_position = None, None
+    for i, (offset_start, offset_end) in enumerate(offsets):
+        if offset_start <= answer_start <= offset_end:
+            token_start_position = i
+        if offset_start <= answer_end <= offset_end:
+            token_end_position = i
+            break
+
     if token_start_position is None or token_end_position is None:
+        return None, None, None
+
+    return input_ids, token_start_position, token_end_position
+
+def preprocess_data(example):
+    context = example["context"]
+    question = example["question"]
+    answer = example["answers"]["text"][0]
+
+    input_text, token_start_position, token_end_position = prepare_data(context, question, answer)
+
+    if input_text is None or token_start_position is None or token_end_position is None:
         return {
             "input_ids": None,
+            "attention_mask": None,
             "start_position": None,
-            "end_position": None
+            "end_position": None,
         }
 
-    # Get input_ids
-    input_ids = model.tokenizer.encode(input_text, max_length=512, padding="max_length", truncation=True)
+    input_ids = torch.tensor(input_text, dtype=torch.long).unsqueeze(0)
+    attention_mask = (input_ids != 0).float()
+    encoding = {"input_ids": input_ids, "attention_mask": attention_mask}
+    input_ids = encoding["input_ids"].squeeze()
+    attention_mask = encoding["attention_mask"].squeeze()
 
     return {
-        "input_ids": input_ids,
+        "input_ids": input_ids.tolist(),
+        "attention_mask": attention_mask.tolist(),
         "start_position": token_start_position,
-        "end_position": token_end_position
+        "end_position": token_end_position,
     }
 
-# Preprocess the dataset
-train_data = dataset["train"].map(preprocess_data, remove_columns=['id', 'title', 'context', 'question', 'answers'], load_from_cache_file=False)
-train_data = train_data.filter(lambda x: x['input_ids'] is not None)
 
+# Preprocess the dataset
+train_percentage = 0.05     # We use only 1%, only testing for now
+train_size = int(len(dataset["train"]) * train_percentage)
+train_data = dataset["train"].select(range(train_size)).map(preprocess_data, remove_columns=['id', 'title', 'context', 'question', 'answers'], load_from_cache_file=False).filter(lambda example: example['input_ids'] is not None)
 # Prepare a DataLoader for the training data
 # ==========================================
 
 from torch.utils.data import DataLoader
 
+from torch.nn.utils.rnn import pad_sequence
+
 train_dataset = torch.utils.data.TensorDataset(
-    torch.stack(train_data["input_ids"]),
+    pad_sequence([torch.tensor(ids) for ids in train_data["input_ids"]], batch_first=True),
+    pad_sequence([torch.tensor(mask) for mask in train_data["attention_mask"]], batch_first=True),
     torch.tensor(train_data["start_position"]),
     torch.tensor(train_data["end_position"])
 )
@@ -152,23 +225,30 @@ optimizer = Adam(model.parameters(), lr=3e-5)
 
 # Training loop
 epochs = 2
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model.to(device)
+
+from tqdm import tqdm
 
 for epoch in range(epochs):
+    print(f"Epoch {epoch+1}/{epochs}")
+
+    progress_bar = tqdm(train_dataloader, desc="Training", unit="batch")
+    
     model.train()
-    for batch in train_dataloader:
+    for batch in progress_bar:
         optimizer.zero_grad()
         
-        input_ids, attention_mask, start_positions, end_positions = [x.to(device) for x in batch]
-        start_logits, end_logits = model(input_ids=input_ids)
+        input_ids, attention_mask, start_position, end_position = [x.to(device) for x in batch]
+        start_logits, end_logits = model(input_ids=input_ids, attention_mask=attention_mask)
         
-        loss_start = nn.CrossEntropyLoss()(start_logits, start_positions)
-        loss_end = nn.CrossEntropyLoss()(end_logits, end_positions)
+        loss_start = nn.CrossEntropyLoss()(start_logits, start_position)
+        loss_end = nn.CrossEntropyLoss()(end_logits, end_position)
         total_loss = (loss_start + loss_end) / 2
 
         total_loss.backward()
         optimizer.step()
+        
+        # Update the progress bar description with the current loss, accuracy, or any other metric
+        progress_bar.set_description(f"Training (loss={total_loss:.4f})")
 
     print(f"Epoch {epoch + 1}/{epochs}, Loss: {total_loss.item()}")
 
@@ -177,6 +257,9 @@ for epoch in range(epochs):
 
 input_text = ["What is the capital of France?", "Who wrote 'The Catcher in the Rye'?"]
 input_ids = model.tokenizer(input_text, return_tensors="pt", padding=True, truncation=True)["input_ids"]
+
+input_ids = input_ids.to(device)
+
 start_logits, end_logits = model(input_ids=input_ids)
 
 answers = decode_answer(input_text, start_logits, end_logits)
